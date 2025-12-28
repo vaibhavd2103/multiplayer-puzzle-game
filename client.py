@@ -19,6 +19,7 @@ class SessionStats:
     )
     def __init__(self, name):
         self.name = name
+        self._lock = threading.Lock()
         self.start_time = time.time()
         self.total = 0
         self.correct = 0
@@ -52,42 +53,44 @@ class SessionStats:
     def observe(self, message, state):
         """Feed one broadcast in. Returns a list of lines to print (or [])."""
         lines = []
+        with self._lock:
+            parsed = self._parse_move(message)
+            if parsed is not None:
+                _value, row, col, is_correct = parsed
+                self.total += 1
+                if is_correct:
+                    self.correct += 1
+                    self.round_correct += 1
+                    self.current_streak += 1
+                    self.best_streak = max(
+                        self.best_streak, self.current_streak
+                    )
+                else:
+                    self.incorrect += 1
+                    self.round_incorrect += 1
+                    self.current_streak = 0
+                    key = (row, col)
+                    self.mistake_cells[key] = self.mistake_cells.get(key, 0) + 1
 
-        parsed = self._parse_move(message)
-        if parsed is not None:
-            _value, row, col, is_correct = parsed
-            self.total += 1
-            if is_correct:
-                self.correct += 1
-                self.round_correct += 1
-                self.current_streak += 1
-                self.best_streak = max(self.best_streak, self.current_streak)
-            else:
-                self.incorrect += 1
-                self.round_incorrect += 1
-                self.current_streak = 0
-                key = (row, col)
-                self.mistake_cells[key] = self.mistake_cells.get(key, 0) + 1
+            if state:
+                scores = state.get("scores", {})
+                if self.name in scores:
+                    self.points = scores[self.name]
 
-        if state:
-            scores = state.get("scores", {})
-            if self.name in scores:
-                self.points = scores[self.name]
-
-            new_round = state.get("round")
-            if new_round is not None:
-                if self.round is None:
-                    self.round = new_round
-                    self.round_start = time.time()
-                elif new_round > self.round:
-                    lines = self._round_summary(self.round)
-                    self.rounds_completed += 1
-                    self.round = new_round
-                    self.round_correct = 0
-                    self.round_incorrect = 0
-                    self.round_start = time.time()
-                elif new_round < self.round:
-                    self.round = new_round
+                new_round = state.get("round")
+                if new_round is not None:
+                    if self.round is None:
+                        self.round = new_round
+                        self.round_start = time.time()
+                    elif new_round > self.round:
+                        lines = self._round_summary(self.round)
+                        self.rounds_completed += 1
+                        self.round = new_round
+                        self.round_correct = 0
+                        self.round_incorrect = 0
+                        self.round_start = time.time()
+                    elif new_round < self.round:
+                        self.round = new_round
 
         return lines
     
@@ -111,33 +114,34 @@ class SessionStats:
             f"  Correct:   {self.round_correct}",
             f"  Incorrect: {self.round_incorrect}",
             f"  Accuracy:  {acc:.0f}%",
-            f"  Duration:  {self._fmt_duration(time.time() - self.round_start)}"
+            f"  Duration:  {self._fmt_duration(time.time() - self.round_start)}",
             f"  Points:    {self.points}",
             f"  Best streak so far: {self.best_streak}",
             "-" * 40,
         ]
 
     def format(self):
-        acc = self._accuracy(self.correct, self.total)
-        lines = [
-            "",
-            "=" * 40,
-            f"Session stats for {self.name}",
-            f"  Session time:    {self._fmt_duration(time.time() - self.start_time)}",
-            f"  Round:           {self.round}",
-            f"  Rounds cleared:  {self.rounds_completed}",
-            f"  Total moves:     {self.total}",
-            f"  Correct:         {self.correct}",
-            f"  Incorrect:       {self.incorrect}",
-            f"  Accuracy:        {acc:.0f}%",
-            f"  Current streak:  {self.current_streak}",
-            f"  Best streak:     {self.best_streak}",
-            f"  Points:          {self.points}",
-        ]
-        if self.mistake_cells:
+        with self._lock:
+            acc = self._accuracy(self.correct, self.total)
+            lines = [
+                "",
+                "=" * 40,
+                f"Session stats for {self.name}",
+                f"  Session time:    {self._fmt_duration(time.time() - self.start_time)}",
+                f"  Round:           {self.round}",
+                f"  Rounds cleared:  {self.rounds_completed}",
+                f"  Total moves:     {self.total}",
+                f"  Correct:         {self.correct}",
+                f"  Incorrect:       {self.incorrect}",
+                f"  Accuracy:        {acc:.0f}%",
+                f"  Current streak:  {self.current_streak}",
+                f"  Best streak:     {self.best_streak}",
+                f"  Points:          {self.points}",
+            ]
             worst = sorted(
                 self.mistake_cells.items(), key=lambda kv: kv[1], reverse=True
             )[:3]
+        if worst:
             cells = ", ".join(f"({r},{c})x{n}" for (r, c), n in worst)
             lines.append(f"  Toughest cells:  {cells}")
         lines.append("=" * 40)
@@ -170,8 +174,14 @@ class Client:
             return False
         sock.settimeout(None)
         self.tcp_sock = sock
-        send_json(sock, {"type": "hello", "role": "client", "name": self.name})
-        first = recv_json(sock)
+        try:
+            send_json(sock, {"type": "hello", "role": "client", "name": self.name})
+            first = recv_json(sock)
+        except OSError as e:
+            print(f"[CLIENT] Handshake failed: {e}")
+            sock.close()
+            self.connected = False
+            return False
         if first and first.get("type") == "full_state":
             self.state = first.get("state")
             self.connected = True
@@ -194,7 +204,7 @@ class Client:
                 data, _ = sock.recvfrom(1024)
                 msg = data.decode("utf-8")
                 parts = msg.split()
-                if len(parts) == 3 and parts[0] == "PRIMARY_ALIVE":
+                if len(parts) == 3 and parts[0] == "primary_alive":
                     host = parts[1]
                     port = int(parts[2])
                     self.server_addr = (host, port)
@@ -202,6 +212,8 @@ class Client:
                     break
         except socket.timeout:
             print("[CLIENT] No server announcement received.")
+        finally:
+            sock.close()
 
     def _receiver_loop(self):
         while self.running:
@@ -355,20 +367,26 @@ def main():
 
     client = Client(args.name, args.host, args.port)
 
-    if args.host and args.port:
-        print(f"[CLIENT] Using specified server {args.host}:{args.port}")
-        if client.connect():
-            client.input_loop()
-    else:
-        while True:
-            client.discover_server()
-            if client.server_addr is None:
-                time.sleep(2)
-                continue
+    try:
+        if args.host and args.port:
+            print(f"[CLIENT] Using specified server {args.host}:{args.port}")
             if client.connect():
                 client.input_loop()
-            print("[CLIENT] Disconnected. Retrying in 2 seconds...")
-            time.sleep(2)
+        else:
+            while client.running:
+                client.discover_server()
+                if client.server_addr is None:
+                    time.sleep(2)
+                    continue
+                if client.connect():
+                    client.input_loop()
+                if not client.running:
+                    break
+                print("[CLIENT] Disconnected. Retrying in 2 seconds...")
+                time.sleep(2)
+    except KeyboardInterrupt:
+        print("\n[CLIENT] Shutting down.")
+        client.running = False
 
 
 if __name__ == "__main__":
