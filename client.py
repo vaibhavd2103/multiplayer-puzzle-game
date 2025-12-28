@@ -1,4 +1,5 @@
 import argparse
+import re
 import socket
 import threading
 import time
@@ -12,8 +13,13 @@ from common import (
 )
 
 class SessionStats:
+    _MOVE_RE = re.compile(
+        r"^(?P<player>.+?) placed (?P<value>-?\d+) at "
+        r"\((?P<row>\d+), ?(?P<col>\d+)\) - (?P<outcome>correct|incorrect)\b"
+    )
     def __init__(self, name):
         self.name = name
+        self.start_time = time.time()
         self.total = 0
         self.correct = 0
         self.incorrect = 0
@@ -21,26 +27,47 @@ class SessionStats:
         self.best_streak = 0
         self.points = 0
         self.round = None
+        self.rounds_completed = 0
         self.round_correct = 0
         self.round_incorrect = 0
+        self.round_start = self.start_time
+        self.mistake_cells = {}
+
+    def _parse_move(self, message):
+        if not message:
+            return None
+        m = self._MOVE_RE.match(message)
+        if m is None or m.group("player") != self.name:
+            return None
+        return (
+            int(m.group("value")),
+            int(m.group("row")),
+            int(m.group("col")),
+            m.group("outcome") == "correct",
+        )
 
     def _is_my_move(self, message):
-        return bool(message) and message.startswith(f"{self.name} placed ")
+        return self._parse_move(message) is not None
 
     def observe(self, message, state):
+        """Feed one broadcast in. Returns a list of lines to print (or [])."""
         lines = []
 
-        if self._is_my_move(message):
+        parsed = self._parse_move(message)
+        if parsed is not None:
+            _value, row, col, is_correct = parsed
             self.total += 1
-            if "- correct" in message:
+            if is_correct:
                 self.correct += 1
                 self.round_correct += 1
                 self.current_streak += 1
                 self.best_streak = max(self.best_streak, self.current_streak)
-            elif "- incorrect" in message:
+            else:
                 self.incorrect += 1
                 self.round_incorrect += 1
                 self.current_streak = 0
+                key = (row, col)
+                self.mistake_cells[key] = self.mistake_cells.get(key, 0) + 1
 
         if state:
             scores = state.get("scores", {})
@@ -48,19 +75,35 @@ class SessionStats:
                 self.points = scores[self.name]
 
             new_round = state.get("round")
-            if self.round is None:
-                self.round = new_round
-            elif new_round != self.round:
-                lines = self._round_summary(self.round)
-                self.round = new_round
-                self.round_correct = 0
-                self.round_incorrect = 0
+            if new_round is not None:
+                if self.round is None:
+                    self.round = new_round
+                    self.round_start = time.time()
+                elif new_round > self.round:
+                    lines = self._round_summary(self.round)
+                    self.rounds_completed += 1
+                    self.round = new_round
+                    self.round_correct = 0
+                    self.round_incorrect = 0
+                    self.round_start = time.time()
+                elif new_round < self.round:
+                    self.round = new_round
 
         return lines
+    
+    @staticmethod
+    def _fmt_duration(seconds):
+        seconds = int(max(0, seconds))
+        minutes, secs = divmod(seconds, 60)
+        return f"{minutes}m {secs:02d}s" if minutes else f"{secs}s"
+
+    @staticmethod
+    def _accuracy(correct, total):
+        return (correct / total * 100) if total else 0.0
 
     def _round_summary(self, finished_round):
         attempts = self.round_correct + self.round_incorrect
-        acc = (self.round_correct / attempts * 100) if attempts else 0.0
+        acc = self._accuracy(self.round_correct, attempts)
         return [
             "",
             "-" * 40,
@@ -68,27 +111,37 @@ class SessionStats:
             f"  Correct:   {self.round_correct}",
             f"  Incorrect: {self.round_incorrect}",
             f"  Accuracy:  {acc:.0f}%",
+            f"  Duration:  {self._fmt_duration(time.time() - self.round_start)}"
             f"  Points:    {self.points}",
             f"  Best streak so far: {self.best_streak}",
             "-" * 40,
         ]
 
     def format(self):
-        acc = (self.correct / self.total * 100) if self.total else 0.0
-        return [
+        acc = self._accuracy(self.correct, self.total)
+        lines = [
             "",
             "=" * 40,
             f"Session stats for {self.name}",
-            f"  Round:          {self.round}",
-            f"  Total moves:    {self.total}",
-            f"  Correct:        {self.correct}",
-            f"  Incorrect:      {self.incorrect}",
-            f"  Accuracy:       {acc:.0f}%",
-            f"  Current streak: {self.current_streak}",
-            f"  Best streak:    {self.best_streak}",
-            f"  Points:         {self.points}",
-            "=" * 40,
+            f"  Session time:    {self._fmt_duration(time.time() - self.start_time)}",
+            f"  Round:           {self.round}",
+            f"  Rounds cleared:  {self.rounds_completed}",
+            f"  Total moves:     {self.total}",
+            f"  Correct:         {self.correct}",
+            f"  Incorrect:       {self.incorrect}",
+            f"  Accuracy:        {acc:.0f}%",
+            f"  Current streak:  {self.current_streak}",
+            f"  Best streak:     {self.best_streak}",
+            f"  Points:          {self.points}",
         ]
+        if self.mistake_cells:
+            worst = sorted(
+                self.mistake_cells.items(), key=lambda kv: kv[1], reverse=True
+            )[:3]
+            cells = ", ".join(f"({r},{c})x{n}" for (r, c), n in worst)
+            lines.append(f"  Toughest cells:  {cells}")
+        lines.append("=" * 40)
+        return lines
 
 
 class Client:
