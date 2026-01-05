@@ -89,6 +89,34 @@ class GameState:
                 msg = f"{player} placed {value} at ({row}, {col}) - incorrect."
                 return False, msg
 
+    def reveal_hint(self, player):
+        with self.lock:
+            if player not in self.scores:
+                self.scores[player] = 0
+
+            empty = [
+                (r, c)
+                for r in range(GRID_SIZE)
+                for c in range(GRID_SIZE)
+                if self.grid[r][c] == 0
+            ]
+            if not empty:
+                return False, "No empty cells left to reveal."
+
+            row, col = random.choice(empty)
+            value = self.solution[row][col]
+            self.grid[row][col] = value
+            self.scores[player] -= self.HINT_PENALTY
+            msg = (
+                f"{player} used a hint: ({row}, {col}) = {value} "
+                f"(-{self.HINT_PENALTY} points)"
+            )
+            if self._board_full():
+                self._start_new_round()
+                msg += " Board complete! New round started."
+            return True, msg
+
+
 class PrimaryServer:
     def __init__(self, host="0.0.0.0", port=DEFAULT_SERVER_PORT):
         self.host = host
@@ -304,6 +332,8 @@ class PrimaryServer:
                     _, text = self.game.apply_move(
                         name, msg.get("row"), msg.get("col"), msg.get("value")
                     )
+                elif mtype == "hint":
+                    _, text = self.game.reveal_hint(name)
                 else:
                     continue
 
