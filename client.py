@@ -328,15 +328,19 @@ class Client:
     def _handle_command(self, cmd):
         name = cmd[1:].strip().lower()
         redraw_board = False
+        want_hint = False
         with self.print_lock:
             if name in ("stats", "s"):
                 for line in self.stats.format():
                     print(line)
             elif name in ("board", "b"):
                 redraw_board = True
+            elif name in ("hint", "hi"):
+                want_hint = True
             elif name in ("help", "h", "?"):
                 print("\nCommands:")
                 print("  <row> <col> <value>   make a move (e.g. 0 1 5)")
+                print("  /hint                 reveal a random cell (costs points)")
                 print("  /stats                show your session stats")
                 print("  /board                redraw the current board")
                 print("  /help                 show this help")
@@ -347,6 +351,11 @@ class Client:
                 self._print_prompt()
         if redraw_board:
             self.print_state()
+        if want_hint:
+            try:
+                send_json(self.tcp_sock, {"type": "hint"})
+            except (ConnectionResetError, OSError):
+                print("[CLIENT] Cannot request hint, server disconnected.")
 
     def _reconnect(self):
         while self.running:

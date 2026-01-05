@@ -17,6 +17,8 @@ from common import (
 
 
 class GameState:
+    HINT_PENALTY = 2
+
     def __init__(self):
         self.lock = threading.Lock()
         self.round = 1
@@ -39,6 +41,18 @@ class GameState:
                 if random.random() < 0.4:
                     grid[r][c] = 0
         return grid
+
+    def _board_full(self):
+        return all(
+            self.grid[r][c] != 0
+            for r in range(GRID_SIZE)
+            for c in range(GRID_SIZE)
+        )
+
+    def _start_new_round(self):
+        self.round += 1
+        self.solution = self._generate_solution()
+        self.grid = self._generate_puzzle_from_solution()
 
     def as_dict(self):
         return {
@@ -65,15 +79,8 @@ class GameState:
                 self.grid[row][col] = value
                 self.scores[player] += 1
                 msg = f"{player} placed {value} at ({row}, {col}) - correct!"
-                # If board is full, start new round
-                if all(
-                    self.grid[r][c] != 0
-                    for r in range(GRID_SIZE)
-                    for c in range(GRID_SIZE)
-                ):
-                    self.round += 1
-                    self.solution = self._generate_solution()
-                    self.grid = self._generate_puzzle_from_solution()
+                if self._board_full():
+                    self._start_new_round()
                     msg += " Board complete! New round started."
                 return True, msg
             else:
@@ -81,7 +88,6 @@ class GameState:
                 self.scores[player] -= 1
                 msg = f"{player} placed {value} at ({row}, {col}) - incorrect."
                 return False, msg
-
 
 class PrimaryServer:
     def __init__(self, host="0.0.0.0", port=DEFAULT_SERVER_PORT):
@@ -118,6 +124,34 @@ class PrimaryServer:
                     # If sending fails, remove dead backup from dictionary.
                     self.backups.pop(sock, None)
 
+    def _advertised_host(self):
+    
+        if self.host not in ("0.0.0.0", "", None):
+            return self.host
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("8.8.8.8", 80))
+            return probe.getsockname()[0]
+        except OSError:
+            return "127.0.0.1"
+        finally:
+            probe.close()
+
+    def _announce_presence_loop(self):
+    
+        host = self._advertised_host()
+        print(f"[PRIMARY] Announcing presence as {host}:{self.port}")
+        while self.running:
+            message = f"primary_alive {host} {self.port}"
+            try:
+                self.multicast_sender.sendto(
+                    message.encode("utf-8"),
+                    (MULTICAST_GROUP, MULTICAST_PORT),
+                )
+            except OSError:
+                pass
+            time.sleep(2)
+
     def start(self):
         print(f"[PRIMARY] Listening on {self.host}:{self.port}")
         threading.Thread(target=self._accept_loop, daemon=True).start()
@@ -126,6 +160,9 @@ class PrimaryServer:
         ).start()
         threading.Thread(
             target=self._broadcast_backups, daemon=True
+        ).start()
+        threading.Thread(
+            target=self._announce_presence_loop, daemon=True
         ).start()
         while self.running:
             time.sleep(1)
@@ -261,19 +298,22 @@ class PrimaryServer:
                 msg = recv_json(conn)
                 if msg is None:
                     break
-                if msg.get("type") == "move":
-                    row = msg.get("row")
-                    col = msg.get("col")
-                    value = msg.get("value")
-                    valid, text = self.game.apply_move(name, row, col, value)
-                    # Broadcast updated state
-                    update = {
-                        "type": "update",
-                        "state": self.game.as_dict(),
-                        "message": text,
-                    }
-                    self.broadcast(update)
-                    self.send_to_backups(update)
+
+                mtype = msg.get("type")
+                if mtype == "move":
+                    _, text = self.game.apply_move(
+                        name, msg.get("row"), msg.get("col"), msg.get("value")
+                    )
+                else:
+                    continue
+
+                update = {
+                    "type": "update",
+                    "state": self.game.as_dict(),
+                    "message": text,
+                }
+                self.broadcast(update)
+                self.send_to_backups(update)
         except (ConnectionResetError, OSError):
             pass
         finally:
@@ -318,30 +358,7 @@ class PrimaryServer:
             print("[PRIMARY] Removing dead backup")
             self.backups.pop(sock, None)
 
-    # NOTE: multicast heartbeat loop is left commented out.
-    # All heartbeats are now TCP JSON messages ("primary_alive").
-    #
-    # def _multicast_heartbeat_loop(self):
-    #     while self.running:
-    #         message = f"primary_alive {self.host} {self.port}"
-    #         try:
-    #             self.multicast_sender.sendto(
-    #                 message.encode("utf-8"), (MULTICAST_GROUP, MULTICAST_PORT)
-    #             )
-    #         except OSError:
-    #             pass
-    #         time.sleep(2)
-
-
 class BackupServer:
-    """
-    Backup server:
-    - Optionally discovers primary via multicast (if no primary_host/port given).
-    - Connects to primary via TCP and receives state updates and heartbeats.
-    - If heartbeats stop, runs an election:
-      the backup with the highest id promotes itself to primary.
-    """
-
     def __init__(self, primary_host=None, primary_port=None, backup_id=None):
         self.running = True
         self.game_state = None
