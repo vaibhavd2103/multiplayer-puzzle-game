@@ -1,39 +1,46 @@
-
-import argparse
-import random
+#!/usr/bin/env python3
 import socket
 import threading
 import time
+import json
+import random
+import argparse
 
-from common import (
-    GRID_SIZE,
-    DEFAULT_SERVER_PORT,
-    MULTICAST_GROUP,
-    MULTICAST_PORT,
-    send_json,
-    recv_json,
-    create_multicast_sender,
-    create_multicast_listener,
-)
+GRID_SIZE = 5
+DEFAULT_PORT = 6000
+MULTICAST_GROUP = '224.1.1.1'
+MULTICAST_PORT = 5007
 
+def send_json(sock, obj):
+    sock.sendall((json.dumps(obj)+"\n").encode())
 
+def recv_json(sock):
+    data = b""
+    while not data.endswith(b"\n"):
+        try:
+            chunk = sock.recv(4096)
+            if not chunk:
+                return None
+            data += chunk
+        except:
+            return None
+    return json.loads(data.decode().strip())
+
+# =========================
+# GAME STATE
+# =========================
 class GameState:
     def __init__(self):
         self.lock = threading.Lock()
         self.round = 1
-        self.solution = self._generate_solution()
-        self.grid = self._generate_puzzle_from_solution()
-        self.scores = {}  # name -> int
+        self.solution = self._gen_solution()
+        self.grid = self._gen_puzzle()
+        self.scores = {}
 
-    def _generate_solution(self):
-        # Simple solution grid with numbers 1..9
-        return [
-            [random.randint(1, 9) for _ in range(GRID_SIZE)]
-            for _ in range(GRID_SIZE)
-        ]
+    def _gen_solution(self):
+        return [[random.randint(1, 9) for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
 
-    def _generate_puzzle_from_solution(self):
-        # Copy solution and blank out around 40% of cells
+    def _gen_puzzle(self):
         grid = [row[:] for row in self.solution]
         for r in range(GRID_SIZE):
             for c in range(GRID_SIZE):
@@ -42,334 +49,202 @@ class GameState:
         return grid
 
     def as_dict(self):
-        return {
-            "round": self.round,
-            "grid": self.grid,
-            "scores": self.scores,
-        }
+        return {"round": self.round, "grid": self.grid, "scores": self.scores}
 
-    def apply_move(self, player, row, col, value):
-        """
-        Returns a tuple (valid, message).
-        """
+    def apply_move(self, player, r, c, v):
         with self.lock:
-            if player not in self.scores:
-                self.scores[player] = 0
-
-            if not (0 <= row < GRID_SIZE and 0 <= col < GRID_SIZE):
-                return False, "Cell out of range."
-
-            if self.grid[row][col] != 0:
-                return False, "Cell already filled."
-
-            if self.solution[row][col] == value:
-                self.grid[row][col] = value
+            self.scores.setdefault(player, 0)
+            if not (0 <= r < GRID_SIZE and 0 <= c < GRID_SIZE):
+                return False, "Out of range"
+            if self.grid[r][c] != 0:
+                return False, "Cell already filled"
+            if self.solution[r][c] == v:
+                self.grid[r][c] = v
                 self.scores[player] += 1
-                msg = f"{player} placed {value} at ({row}, {col}) - correct!"
-                # If board is full, start new round
-                if all(self.grid[r][c] != 0 for r in range(GRID_SIZE) for c in range(GRID_SIZE)):
-                    self.round += 1
-                    self.solution = self._generate_solution()
-                    self.grid = self._generate_puzzle_from_solution()
-                    msg += " Board complete! New round started."
-                return True, msg
+                return True, f"{player} placed {v} at ({r},{c}) ✓"
             else:
-                # Incorrect move
                 self.scores[player] -= 1
-                msg = f"{player} placed {value} at ({row}, {col}) - incorrect."
-                return False, msg
+                return False, f"{player} placed {v} at ({r},{c}) ✗"
 
-
+# =========================
+# PRIMARY SERVER
+# =========================
 class PrimaryServer:
-    def __init__(self, host="0.0.0.0", port=DEFAULT_SERVER_PORT):
+    def __init__(self, host, port, initial_state=None):
         self.host = host
         self.port = port
-        self.game = GameState()
-
-        self.clients = {}  # socket -> name
-        self.backups = set()  # sockets
+        self.clients = {}
+        self.backups = {}
+        self.next_backup_id = 1
         self.running = True
-
-        self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.tcp_sock.bind((self.host, self.port))
-        self.tcp_sock.listen(5)
-
-        self.multicast_sender = create_multicast_sender()
+        self.game = GameState()
+        if initial_state:
+            self.game.round = initial_state["round"]
+            self.game.grid = initial_state["grid"]
+            self.game.scores = initial_state["scores"]
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((host, port))
+        self.sock.listen(10)
 
     def start(self):
-        print(f"[PRIMARY] Listening for TCP connections on {self.host}:{self.port}")
+        print(f"[PRIMARY] Listening on {self.host}:{self.port}")
         threading.Thread(target=self._accept_loop, daemon=True).start()
-        threading.Thread(target=self._multicast_heartbeat_loop, daemon=True).start()
-
-        try:
-            while self.running:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            print("Shutting down primary server...")
-            self.running = False
+        while self.running:
+            time.sleep(1)
 
     def _accept_loop(self):
         while self.running:
             try:
-                conn, addr = self.tcp_sock.accept()
-                threading.Thread(
-                    target=self._handle_connection, args=(conn, addr), daemon=True
-                ).start()
-            except OSError:
+                conn, addr = self.sock.accept()
+                threading.Thread(target=self._handle_conn, args=(conn,), daemon=True).start()
+            except:
                 break
 
-    def _handle_connection(self, conn, addr):
-        print(f"[PRIMARY] New TCP connection from {addr}")
+    def _handle_conn(self, conn):
         hello = recv_json(conn)
-        if not hello or hello.get("type") != "hello":
+        if not hello:
             conn.close()
             return
-
         role = hello.get("role")
         if role == "client":
-            name = hello.get("name", f"client_{addr[0]}")
+            name = hello.get("name","anon")
             self.clients[conn] = name
-            print(f"[PRIMARY] Client '{name}' connected from {addr}")
-            # Add player to score table if missing
-            with self.game.lock:
-                if name not in self.game.scores:
-                    self.game.scores[name] = 0
-            # Send full game state
-            send_json(conn, {"type": "full_state", "state": self.game.as_dict()})
-            # Notify others
-            self.broadcast(
-                {
-                    "type": "info",
-                    "message": f"{name} joined the game.",
-                }
-            )
+            send_json(conn, {"type":"full_state","state":self.game.as_dict()})
             self._client_loop(conn, name)
-
         elif role == "backup":
-            self.backups.add(conn)
-            print(f"[PRIMARY] Backup server connected from {addr}")
-            # Send full state immediately
-            send_json(conn, {"type": "full_state", "state": self.game.as_dict()})
+            bid = self.next_backup_id
+            self.next_backup_id += 1
+            self.backups[conn] = bid
+            print(f"[PRIMARY] Backup {bid} registered")
+            send_json(conn, {"type":"backup_welcome","backup_id":bid,"members":list(self.backups.values()),"state":self.game.as_dict()})
+            self._broadcast_backups()
             self._backup_loop(conn)
-        else:
-            conn.close()
 
     def _client_loop(self, conn, name):
         try:
-            while self.running:
+            while True:
                 msg = recv_json(conn)
                 if msg is None:
                     break
                 if msg.get("type") == "move":
-                    row = msg.get("row")
-                    col = msg.get("col")
-                    value = msg.get("value")
-                    valid, text = self.game.apply_move(name, row, col, value)
-                    # Broadcast updated state
-                    update = {
-                        "type": "update",
-                        "state": self.game.as_dict(),
-                        "message": text,
-                    }
-                    self.broadcast(update)
-                    self.send_to_backups(update)
-        except (ConnectionResetError, OSError):
-            pass
+                    ok,text = self.game.apply_move(name,msg["row"],msg["col"],msg["value"])
+                    update = {"type":"update","state":self.game.as_dict(),"message":text}
+                    self._broadcast(update)
         finally:
-            print(f"[PRIMARY] Client {name} disconnected")
-            if conn in self.clients:
-                del self.clients[conn]
             conn.close()
-            self.broadcast(
-                {
-                    "type": "info",
-                    "message": f"{name} left the game.",
-                }
-            )
+            self.clients.pop(conn,None)
 
     def _backup_loop(self, conn):
         try:
-            while self.running:
-                # At the moment, primary does not expect messages from backups.
-                msg = recv_json(conn)
-                if msg is None:
-                    break
-        except (ConnectionResetError, OSError):
-            pass
+            while recv_json(conn):
+                pass
         finally:
-            print("[PRIMARY] Backup disconnected")
-            if conn in self.backups:
-                self.backups.remove(conn)
+            bid = self.backups.pop(conn,None)
+            print(f"[PRIMARY] Backup {bid} disconnected")
+            self._broadcast_backups()
             conn.close()
 
-    def broadcast(self, obj):
-        # Send to all clients
-        dead = []
-        for sock in self.clients:
-            try:
-                send_json(sock, obj)
-            except OSError:
-                dead.append(sock)
-        for sock in dead:
-            name = self.clients.get(sock, "?")
-            print(f"[PRIMARY] Removing dead client {name}")
-            del self.clients[sock]
+    def _broadcast(self, obj):
+        for c in list(self.clients):
+            try: send_json(c,obj)
+            except: self.clients.pop(c,None)
+        for b in list(self.backups):
+            try: send_json(b,obj)
+            except: self.backups.pop(b,None)
 
-    def send_to_backups(self, obj):
-        dead = []
-        for sock in self.backups:
-            try:
-                send_json(sock, obj)
-            except OSError:
-                dead.append(sock)
-        for sock in dead:
-            print("[PRIMARY] Removing dead backup")
-            self.backups.remove(sock)
+    def _broadcast_backups(self):
+        members = list(self.backups.values())
+        for b in list(self.backups):
+            try: send_json(b, {"type":"backup_members","members":members})
+            except: self.backups.pop(b,None)
 
-    def _multicast_heartbeat_loop(self):
-        while self.running:
-            message = f"PRIMARY_ALIVE {self.host} {self.port}"
-            try:
-                self.multicast_sender.sendto(
-                    message.encode("utf-8"), (MULTICAST_GROUP, MULTICAST_PORT)
-                )
-            except OSError:
-                pass
-            time.sleep(2)
-
-    def _generate_solution(self):
-        self.solution = [
-            [random.randint(1, 9) for _ in range(GRID_SIZE)]
-            for _ in range(GRID_SIZE)
-    ]
-        print("DEBUG solution grid:", self.solution)
-        return self.solution
-
-
-
+# =========================
+# BACKUP SERVER
+# =========================
 class BackupServer:
-    """
-    Backup server:
-    - Listens to multicast to discover primary.
-    - Connects to primary via TCP and receives state updates.
-    - If multicast heartbeats stop, promotes itself to primary.
-    """
-
-    def __init__(self):
-        self.running = True
+    def __init__(self, primary_host, primary_port):
+        self.primary_addr = (primary_host, primary_port)
+        self.backup_id = None
+        self.members = []
+        self.last_seen = time.time()
         self.game_state = None
-        self.primary_addr = None  # (host, port)
-        self.last_heartbeat = time.time()
-        self.mode = "backup"  # or "primary"
-        self.tcp_conn = None
+        self.running = True
+        self.election_done = False  # track if election has already happened
 
     def start(self):
-        print("[BACKUP] Starting in backup mode")
-        threading.Thread(target=self._listen_multicast_loop, daemon=True).start()
-        threading.Thread(target=self._monitor_primary_loop, daemon=True).start()
+        print("[BACKUP] Starting")
+        threading.Thread(target=self._connect_loop, daemon=True).start()
+        threading.Thread(target=self._monitor_loop, daemon=True).start()
+        while self.running:
+            time.sleep(1)
 
-        try:
-            while self.running:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            print("Stopping backup server...")
-            self.running = False
-
-    def _listen_multicast_loop(self):
-        sock = create_multicast_listener()
-        while self.running and self.mode == "backup":
+    def _connect_loop(self):
+        while self.running:
             try:
-                data, _ = sock.recvfrom(1024)
-            except OSError:
-                break
-            msg = data.decode("utf-8")
-            parts = msg.split()
-            if len(parts) == 3 and parts[0] == "PRIMARY_ALIVE":
-                host = parts[1]
-                port = int(parts[2])
-                self.last_heartbeat = time.time()
-                if self.primary_addr is None:
-                    self.primary_addr = (host, port)
-                    print(f"[BACKUP] Discovered primary at {host}:{port}")
-                    threading.Thread(
-                        target=self._connect_to_primary, daemon=True
-                    ).start()
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.connect(self.primary_addr)
+                send_json(sock, {"type":"hello","role":"backup"})
+                while True:
+                    msg = recv_json(sock)
+                    if msg is None: break
+                    self.last_seen = time.time()
+                    if msg["type"]=="backup_welcome":
+                        self.backup_id = msg["backup_id"]
+                        self.members = msg["members"]
+                        self.game_state = msg["state"]
+                        print(f"[BACKUP {self.backup_id}] Connected to PRIMARY")
+                    elif msg["type"]=="backup_members":
+                        self.members = msg["members"]
+                        print(f"[BACKUP {self.backup_id}] Members: {self.members}")
+                    elif msg["type"]=="update":
+                        self.game_state = msg["state"]
+            except:
+                time.sleep(2)
 
-    def _connect_to_primary(self):
-        if self.primary_addr is None:
-            return
-        host, port = self.primary_addr
-        print(f"[BACKUP] Connecting to primary {host}:{port}")
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect((host, port))
-        self.tcp_conn = sock
-        send_json(sock, {"type": "hello", "role": "backup"})
-        # Receive full state
-        first = recv_json(sock)
-        if first and first.get("type") == "full_state":
-            self.game_state = first.get("state")
-            print("[BACKUP] Initial state received from primary")
-        # Then read updates until connection closes or backup promoted
-        try:
-            while self.running and self.mode == "backup":
-                msg = recv_json(sock)
-                if msg is None:
-                    break
-                if msg.get("type") in ("update",):
-                    self.game_state = msg.get("state")
-        except (ConnectionResetError, OSError):
-            pass
-        finally:
-            print("[BACKUP] Lost connection to primary TCP")
-            try:
-                sock.close()
-            except OSError:
-                pass
-
-    def _monitor_primary_loop(self):
-        """
-        If primary heartbeat is missing for more than 6 seconds,
-        promote this backup to primary using the last known state.
-        """
+    def _monitor_loop(self):
         while self.running:
             time.sleep(2)
-            if self.mode != "backup":
-                continue
-            if time.time() - self.last_heartbeat > 6:
-                print("[BACKUP] Primary heartbeat lost, promoting to PRIMARY")
-                self.mode = "primary"
-                # Start a new PrimaryServer using current game state
-                primary = PrimaryServer()
-                if self.game_state is not None:
-                    primary.game.round = self.game_state.get("round", 1)
-                    primary.game.grid = self.game_state.get("grid", primary.game.grid)
-                    primary.game.scores = self.game_state.get("scores", {})
-                primary.start()
-                break
+            # If primary heartbeat missing for 6+ seconds and election not yet done
+            if time.time() - self.last_seen > 6 and not self.election_done:
+                self._run_election()
+                self.election_done = True
+            # Reset election flag if primary heartbeat is detected
+            elif time.time() - self.last_seen <= 6:
+                self.election_done = False
 
 
+    def _run_election(self):
+        if not self.members:
+            print("[BACKUP] No members known — waiting")
+            return
+        winner = max(self.members)
+        if self.backup_id==winner:
+            print(f"[BACKUP {self.backup_id}] Becoming PRIMARY")
+            PrimaryServer("0.0.0.0", self.primary_addr[1], self.game_state).start()
+        else:
+            print(f"[BACKUP {self.backup_id}] Lost election — staying BACKUP")
+            self.running=True  # stays backup
+
+# =========================
+# MAIN
+# =========================
 def main():
-    parser = argparse.ArgumentParser(description="Distributed Puzzle Game Server")
-    parser.add_argument(
-        "--role",
-        choices=["primary", "backup"],
-        required=True,
-        help="Start as primary or backup server",
-    )
-    parser.add_argument("--host", default="0.0.0.0", help="Host/IP to bind (primary)")
-    parser.add_argument(
-        "--port", type=int, default=DEFAULT_SERVER_PORT, help="TCP port for primary"
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--role", choices=["primary","backup"], required=True)
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", default=DEFAULT_PORT)
+    parser.add_argument("--primary-host")
+    parser.add_argument("--primary-port", type=int)
     args = parser.parse_args()
 
-    if args.role == "primary":
-        srv = PrimaryServer(host=args.host, port=args.port)
-        srv.start()
+    if args.role=="primary":
+        port = int(args.port)
+        PrimaryServer(args.host, port).start()
     else:
-        b = BackupServer()
-        b.start()
+        primary_host = args.primary_host if args.primary_host else "puzzle-primary"
+        primary_port = int(args.primary_port) if args.primary_port else DEFAULT_PORT
+        BackupServer(primary_host, primary_port).start()
 
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()

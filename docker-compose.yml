@@ -1,0 +1,41 @@
+services:
+  primary:
+    build: .
+    container_name: puzzle-primary
+    command: python server.py --role primary --port 6000
+    networks:
+      - puzzle_net
+
+  backup1:
+    build: .
+    container_name: puzzle-backup-1
+    command: python server.py --role backup --primary-host puzzle-primary --primary-port 6000
+    networks:
+      - puzzle_net
+    depends_on:
+      - primary
+
+  backup2:
+    build: .
+    container_name: puzzle-backup-2
+    command: python server.py --role backup --primary-host puzzle-primary --primary-port 6000
+    networks:
+      - puzzle_net
+    depends_on:
+      - primary
+
+  nginx:
+    image: nginx:stable
+    container_name: puzzle-nginx
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+    ports:
+      - "8080:80"
+    networks:
+      - puzzle_net
+    depends_on:
+      - primary
+
+networks:
+  puzzle_net:
+    driver: bridge
