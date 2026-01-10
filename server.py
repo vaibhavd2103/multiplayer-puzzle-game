@@ -6,10 +6,8 @@ import json
 import random
 import argparse
 
-GRID_SIZE = 5
-DEFAULT_PORT = 6000
-MULTICAST_GROUP = '224.1.1.1'
-MULTICAST_PORT = 5007
+from common import DEFAULT_PORT, GRID_SIZE
+
 
 def send_json(sock, obj):
     sock.sendall((json.dumps(obj)+"\n").encode())
@@ -97,15 +95,49 @@ class PrimaryServer:
         while self.running:
             try:
                 conn, addr = self.sock.accept()
-                threading.Thread(target=self._handle_conn, args=(conn,), daemon=True).start()
-            except:
+                print(f"[PRIMARY] Accepted connection from {addr}")
+                threading.Thread(target=self._handle_conn, args=(conn, addr), daemon=True).start()
+            except OSError:
                 break
 
-    def _handle_conn(self, conn):
+    def _handle_conn(self, conn, addr):
+        print(f"[PRIMARY] New TCP connection from {addr}")
         hello = recv_json(conn)
-        if not hello:
+        print(f"[PRIMARY] Received message: {hello}")
+        if not hello or hello.get("type") != "hello":
+            print(f"[PRIMARY] Invalid hello message: {hello}")
             conn.close()
             return
+
+        role = hello.get("role")
+        if role == "client":
+            name = hello.get("name", f"client_{addr[0]}")
+            self.clients[conn] = name
+            print(f"[PRIMARY] Client '{name}' connected from {addr}")
+            # Add player to score table if missing
+            with self.game.lock:
+                if name not in self.game.scores:
+                    self.game.scores[name] = 0
+            # Send full game state
+            send_json(conn, {"type": "full_state", "state": self.game.as_dict()})
+            # Notify others
+            self.broadcast(
+                {
+                    "type": "info",
+                    "message": f"{name} joined the game.",
+                }
+            )
+            self._client_loop(conn, name)
+
+        elif role == "backup":
+            self.backups[conn] = addr
+            print(f"[PRIMARY] Backup server connected from {addr}")
+            # Send full state immediately
+            send_json(conn, {"type": "full_state", "state": self.game.as_dict()})
+            self._backup_loop(conn)
+        else:
+            print(f"[PRIMARY] Unknown role: {role}")
+            conn.close()
         role = hello.get("role")
         if role == "client":
             name = hello.get("name","anon")
@@ -128,9 +160,17 @@ class PrimaryServer:
                 if msg is None:
                     break
                 if msg.get("type") == "move":
-                    ok,text = self.game.apply_move(name,msg["row"],msg["col"],msg["value"])
-                    update = {"type":"update","state":self.game.as_dict(),"message":text}
+                    row = msg.get("row")
+                    col = msg.get("col")
+                    value = msg.get("value")
+                    valid, text = self.game.apply_move(name, row, col, value)
+                    update = {
+                        "type": "update",
+                        "state": self.game.as_dict(),
+                        "message": text,
+                    }
                     self._broadcast(update)
+                    send_json(conn, update)
         finally:
             conn.close()
             self.clients.pop(conn,None)

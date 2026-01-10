@@ -3,18 +3,13 @@ import socket
 import threading
 import time
 
-from common import (
-    MULTICAST_GROUP,
-    MULTICAST_PORT,
-    send_json,
-    recv_json,
-    create_multicast_listener,
-)
+from common import send_json, recv_json, create_multicast_listener, GRID_SIZE
+
 
 class Client:
-    def __init__(self, name):
+    def __init__(self, name, host=None, port=None):
         self.name = name
-        self.server_addr = None
+        self.server_addr = (host, port) if host and port else None
         self.tcp_sock = None
         self.running = True
         self.state = None
@@ -22,9 +17,13 @@ class Client:
 
     # ---------------- DISCOVERY ----------------
     def discover_server(self):
+        if self.server_addr:
+            print(f"[CLIENT] Using specified server {self.server_addr}")
+            return
+
         sock = create_multicast_listener()
         sock.settimeout(5)
-        print("[CLIENT] Discovering primary...")
+        print("[CLIENT] Discovering primary via multicast...")
         try:
             while True:
                 data, _ = sock.recvfrom(1024)
@@ -35,27 +34,33 @@ class Client:
                     print(f"[CLIENT] Found PRIMARY {self.server_addr}")
                     return
         except socket.timeout:
-            print("[CLIENT] No primary found")
+            print("[CLIENT] No primary found via multicast")
 
     # ---------------- CONNECT ----------------
     def connect(self):
+        if not self.server_addr:
+            return False
+        print(f"[CLIENT] Attempting to connect to server at {self.server_addr}")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.tcp_sock.connect(self.server_addr)
-            send_json(self.tcp_sock, {
-                "type": "hello",
-                "role": "client",
-                "name": self.name
-            })
+            sock.connect(self.server_addr)
+            print(f"[CLIENT] Successfully connected to server at {self.server_addr}")
+        except Exception as e:
+            print(f"[CLIENT] Connection failed: {e}")
+            return False
 
-            first = recv_json(self.tcp_sock)
-            self.state = first["state"]
-            self.connected = True
-            print("[CLIENT] Connected")
-
-            threading.Thread(target=self._receiver, daemon=True).start()
+        self.tcp_sock = sock
+        send_json(sock, {"type": "hello", "role": "client", "name": self.name})
+        first = recv_json(sock)
+        if first and first.get("type") == "full_state":
+            self.state = first.get("state")
+            print("[CLIENT] Connected and received initial game state.")
+            self.print_state("Welcome to the distributed puzzle game!")
+            self.print_grid()
+            threading.Thread(target=self._receiver_loop, daemon=True).start()
             return True
-        except OSError:
+        else:
+            print("[CLIENT] Failed to receive initial game state.")
             return False
 
     # ---------------- RECEIVER ----------------
@@ -67,10 +72,14 @@ class Client:
                     raise ConnectionResetError
                 self.state = msg.get("state", self.state)
                 self.print_state(msg.get("message", ""))
+                self.print_grid()
             except (OSError, ConnectionResetError):
                 print("[CLIENT] Lost connection to server")
                 self.connected = False
-                self.tcp_sock.close()
+                try:
+                    self.tcp_sock.close()
+                except Exception:
+                    pass
                 self._reconnect()
                 return
 
@@ -101,21 +110,39 @@ class Client:
                     "value": v
                 })
             except Exception:
-                pass
+                print("[CLIENT] Invalid input or send failed")
 
+    # ---------------- PRINT ----------------
     def print_state(self, message):
         if message:
             print("\n" + message)
 
+    def print_grid(self):
+        if not self.state:
+            return
+        print("\nCurrent Puzzle Grid:")
+        for row in self.state["grid"]:
+            print(" ".join(str(cell) if cell != 0 else "." for cell in row))
+        print(f"Scores: {self.state.get('scores', {})}\n")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--name", required=True)
+    parser.add_argument("--host", help="Optional server host (NGINX)")
+    parser.add_argument("--port", type=int, help="Optional server port (NGINX)")
     args = parser.parse_args()
-
-    client = Client(args.name)
-    client.discover_server()
-    if client.connect():
-        client.input_loop()
+    client = Client(args.name, args.host, args.port)
+    
+    if args.host and args.port:
+        client.server_addr = (args.host, args.port)
+        print(f"[CLIENT] Using specified server {client.server_addr}")
+        if client.connect():
+            client.input_loop()
+    else:
+        client.discover_server()
+        if client.connect():
+            client.input_loop()
 
 if __name__ == "__main__":
     main()

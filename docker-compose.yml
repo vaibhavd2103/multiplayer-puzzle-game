@@ -3,6 +3,8 @@ services:
     build: .
     container_name: puzzle-primary
     command: python server.py --role primary --port 6000
+    ports:
+      - "6000:6000" # Expose primary server TCP port to host
     networks:
       - puzzle_net
 
