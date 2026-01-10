@@ -180,7 +180,9 @@ class PrimaryServer:
         elif role == "backup":
             self.backups.add(conn)
             print(f"[PRIMARY] Backup server connected from {addr}")
-            print(f"[PRIMARY] Current backups: {[self.backups.get(b, '?') for b in self.backups]}")
+            ids = [f"{s.getpeername()}" for s in self.backups]
+            print(f"[PRIMARY] Current backups (Remote Addr): {', '.join(ids)}")
+            # print(f"[PRIMARY] Current backups: {[self.backups.get(b, '?') for b in self.backups]}")
             print(f"[PRIMARY] Sending full state to backup from {addr}")
             # Send full state immediately
             send_json(conn, {"type": "full_state", "state": self.game.as_dict()})
