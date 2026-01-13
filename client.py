@@ -18,6 +18,7 @@ class Client:
         self.server_addr = (host, port) if host and port else None
         self.tcp_sock = None
         self.running = True
+        self.connected = False #to keep both the server in sync 
         self.state = None
         self.print_lock = threading.Lock()
 
@@ -26,24 +27,29 @@ class Client:
             return False
         print(f"[CLIENT] Attempting to connect to server at {self.server_addr}")
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5)
         try:
             sock.connect(self.server_addr)
             print(f"[CLIENT] Successfully connected to server at {self.server_addr}")
-        except Exception as e:
+        except OSError as e:
             print(f"[CLIENT] Connection failed: {e}")
+            sock.close()
             return False
-
+        sock.settimeout(None)
         self.tcp_sock = sock
         send_json(sock, {"type": "hello", "role": "client", "name": self.name})
         first = recv_json(sock)
         if first and first.get("type") == "full_state":
             self.state = first.get("state")
+            self.connected = True
             print("[CLIENT] Connected and received initial game state.")
             self.print_state("Welcome to the distributed puzzle game!")
             threading.Thread(target=self._receiver_loop, daemon=True).start()
             return True
         else:
             print("[CLIENT] Failed to receive initial game state.")
+            sock.close()
+            self.connected = False
             return False
 
     def discover_server(self):
@@ -68,40 +74,26 @@ class Client:
         while self.running:
             try:
                 msg = recv_json(self.tcp_sock)
-                if msg is None:
-                    raise ConnectionResetError
-                
-                # Only update state and print if this is a meaningful update
-                if msg.get("type") in ("full_state", "update"):
-                    self.state = msg.get("state", self.state)
-                    # Only print if there's a message or this is the initial state
-                    if msg.get("message") or msg.get("type") == "full_state":
-                        self.print_state(msg.get("message", ""))
-                elif msg.get("type") == "info":
-                    # For info messages, just show the message without reprinting the grid
-                    print(f"\n[INFO] {msg.get('message')}")
-                    
             except (OSError, ConnectionResetError):
-                print("[CLIENT] Lost connection to server")
+                msg = None
+
+            if msg is None:
                 self.connected = False
+                with self.print_lock:
+                    print("\n[CLIENT] Lost connection to server")
                 try:
                     self.tcp_sock.close()
-                except Exception:
+                except OSError:
                     pass
                 self._reconnect()
                 return
-            if msg is None:
-                with self.print_lock:
-                    print("\n[CLIENT] Disconnected from server.")
-                self.running = False
-                break
 
             t = msg.get("type")
-
-            if t in ("update", "full_state"):
-                self.state = msg.get("state")
-                self.print_state(msg.get("message", ""))
-
+            if t in ("full_state", "update"):
+                self.state = msg.get("state", self.state)
+                # Only reprint the board for the initial state or real news
+                if msg.get("message") or t == "full_state":
+                    self.print_state(msg.get("message", ""))
             elif t == "info":
                 with self.print_lock:
                     print(f"\n[INFO] {msg.get('message')}")
@@ -109,6 +101,11 @@ class Client:
 
     def print_state(self, message=""):
         with self.print_lock:
+            if not self.state:
+                if message:
+                    print(f"\n{message}")
+                self._print_prompt()
+                return
             print("\n" + "=" * 40)
             if message:
                 print(message)
@@ -135,6 +132,10 @@ class Client:
                 line = input()
             except EOFError:
                 break
+            except KeyboardInterrupt:
+                print("\n[CLIENT] Interrupted, shutting down.")
+                self.running = False
+                break
 
             if line.strip().lower() == "quit":
                 self.running = False
@@ -154,11 +155,6 @@ class Client:
                     print("Row, col, and value must be integers.")
                     self._print_prompt()
                 continue
-
-            # send_json(
-            #     self.tcp_sock,
-            #     {"type": "move", "row": row, "col": col, "value": value},
-            # )
             try:
                 send_json(
                 self.tcp_sock,
@@ -168,7 +164,6 @@ class Client:
                 print("[CLIENT] Cannot send, server disconnected.")
                 self.running = False
                 break
-
         try:
             self.tcp_sock.close()
         except OSError:
