@@ -5,18 +5,26 @@ import threading
 import time
 
 from common import (
-    MULTICAST_GROUP,
-    MULTICAST_PORT,
-    send_json,
-    recv_json,
+    PROTOCOL_VERSION,
+    ROLE_CLIENT,
+    MSG_HELLO,
+    MSG_FULL_STATE,
+    MSG_UPDATE,
+    MSG_INFO,
+    MSG_MOVE,
+    MSG_HINT,
+    ANNOUNCE_PREFIX,
+    MessageConnection,
     create_multicast_listener,
 )
+
 
 class SessionStats:
     _MOVE_RE = re.compile(
         r"^(?P<player>.+?) placed (?P<value>-?\d+) at "
         r"\((?P<row>\d+), ?(?P<col>\d+)\) - (?P<outcome>correct|incorrect)\b"
     )
+
     def __init__(self, name):
         self.name = name
         self._lock = threading.Lock()
@@ -93,7 +101,7 @@ class SessionStats:
                         self.round = new_round
 
         return lines
-    
+
     @staticmethod
     def _fmt_duration(seconds):
         seconds = int(max(0, seconds))
@@ -152,48 +160,50 @@ class Client:
     def __init__(self, name, host=None, port=None):
         self.name = name
         self.server_addr = (host, port) if host and port else None
-        self.tcp_sock = None
+        self.conn = None
         self.running = True
-        self.connected = False #to keep both the server in sync
+        self.connected = False
         self.state = None
         self.print_lock = threading.Lock()
         self.stats = SessionStats(name)
 
+    # ---------------------------------------------------------------- connection
     def connect(self):
         if not self.server_addr:
             return False
-        print(f"[CLIENT] Attempting to connect to server at {self.server_addr}")
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5)
+        host, port = self.server_addr
+        print(f"[CLIENT] Connecting to {host}:{port}")
         try:
-            sock.connect(self.server_addr)
-            print(f"[CLIENT] Successfully connected to server at {self.server_addr}")
+            conn = MessageConnection.connect(host, port, timeout=5)
         except OSError as e:
             print(f"[CLIENT] Connection failed: {e}")
-            sock.close()
             return False
-        sock.settimeout(None)
-        self.tcp_sock = sock
+
         try:
-            send_json(sock, {"type": "hello", "role": "client", "name": self.name})
-            first = recv_json(sock)
+            conn.send({
+                "type": MSG_HELLO,
+                "role": ROLE_CLIENT,
+                "name": self.name,
+                "version": PROTOCOL_VERSION,
+            })
+            first = conn.recv(timeout=10)
         except OSError as e:
             print(f"[CLIENT] Handshake failed: {e}")
-            sock.close()
-            self.connected = False
+            conn.close()
             return False
-        if first and first.get("type") == "full_state":
-            self.state = first.get("state")
-            self.connected = True
-            print("[CLIENT] Connected and received initial game state.")
-            self.print_state("Welcome to the distributed puzzle game!")
-            threading.Thread(target=self._receiver_loop, daemon=True).start()
-            return True
-        else:
-            print("[CLIENT] Failed to receive initial game state.")
-            sock.close()
-            self.connected = False
+
+        if not first or first.get("type") != MSG_FULL_STATE:
+            print("[CLIENT] Did not receive initial game state.")
+            conn.close()
             return False
+
+        self.conn = conn
+        self.state = first.get("state")
+        self.connected = True
+        print("[CLIENT] Connected and received initial game state.")
+        self.print_state("Welcome to the distributed puzzle game!")
+        threading.Thread(target=self._receiver_loop, daemon=True).start()
+        return True
 
     def discover_server(self):
         sock = create_multicast_listener()
@@ -202,54 +212,59 @@ class Client:
         try:
             while True:
                 data, _ = sock.recvfrom(1024)
-                msg = data.decode("utf-8")
-                parts = msg.split()
-                if len(parts) == 3 and parts[0] == "primary_alive":
-                    host = parts[1]
-                    port = int(parts[2])
-                    self.server_addr = (host, port)
-                    print(f"[CLIENT] Discovered server at {host}:{port}")
-                    break
+                parts = data.decode("utf-8").split()
+                if len(parts) == 3 and parts[0] == ANNOUNCE_PREFIX:
+                    self.server_addr = (parts[1], int(parts[2]))
+                    print(f"[CLIENT] Discovered server at {parts[1]}:{parts[2]}")
+                    return
         except socket.timeout:
             print("[CLIENT] No server announcement received.")
         finally:
             sock.close()
 
     def _receiver_loop(self):
-        while self.running:
-            try:
-                msg = recv_json(self.tcp_sock)
-            except (OSError, ConnectionResetError):
-                msg = None
+        try:
+            for msg in self.conn.messages():
+                if not self.running:
+                    return
+                self._dispatch(msg)
+        except OSError:
+            pass
 
-            if msg is None:
-                self.connected = False
-                with self.print_lock:
-                    print("\n[CLIENT] Lost connection to server")
-                try:
-                    self.tcp_sock.close()
-                except OSError:
-                    pass
-                self._reconnect()
-                return
+        if self.running:
+            self.connected = False
+            with self.print_lock:
+                print("\n[CLIENT] Lost connection to server")
+            self._reconnect()
 
-            t = msg.get("type")
-            if t in ("full_state", "update"):
-                new_state = msg.get("state", self.state)
-                summary = self.stats.observe(msg.get("message", ""), new_state)
-                self.state = new_state
-                if msg.get("message") or t == "full_state":
-                    self.print_state(msg.get("message", ""))
-                if summary:
-                    with self.print_lock:
-                        for line in summary:
-                            print(line)
-                        self._print_prompt()
-            elif t == "info":
+    def _dispatch(self, msg):
+        t = msg.get("type")
+        if t in (MSG_FULL_STATE, MSG_UPDATE):
+            new_state = msg.get("state", self.state)
+            summary = self.stats.observe(msg.get("message", ""), new_state)
+            self.state = new_state
+            if msg.get("message") or t == MSG_FULL_STATE:
+                self.print_state(msg.get("message", ""))
+            if summary:
                 with self.print_lock:
-                    print(f"\n[INFO] {msg.get('message')}")
+                    for line in summary:
+                        print(line)
                     self._print_prompt()
+        elif t == MSG_INFO:
+            with self.print_lock:
+                print(f"\n[INFO] {msg.get('message')}")
+                self._print_prompt()
 
+    def _reconnect(self):
+        while self.running:
+            print("[CLIENT] Primary server down. Rediscovering...")
+            self.discover_server()
+            if self.server_addr and self.connect():
+                print("[CLIENT] Reconnected to primary server")
+                return
+            time.sleep(2)
+
+    # -------------------------------------------------------------------- output
     def print_state(self, message=""):
         with self.print_lock:
             if not self.state:
@@ -272,11 +287,12 @@ class Client:
 
     def _print_prompt(self):
         print(
-            "Enter move as row col value (e.g. 0 1 5), or 'quit': ",
+            "Enter move as row col value (e.g. 0 1 5), '/help', or 'quit': ",
             end="",
             flush=True,
         )
 
+    # --------------------------------------------------------------------- input
     def input_loop(self):
         while self.running:
             try:
@@ -292,7 +308,8 @@ class Client:
             if stripped.lower() == "quit":
                 self.running = False
                 break
-
+            if not stripped:
+                continue
             if stripped.startswith("/"):
                 self._handle_command(stripped)
                 continue
@@ -303,7 +320,6 @@ class Client:
                     print("Invalid format.")
                     self._print_prompt()
                 continue
-
             try:
                 row, col, value = map(int, parts)
             except ValueError:
@@ -311,19 +327,23 @@ class Client:
                     print("Row, col, and value must be integers.")
                     self._print_prompt()
                 continue
-            try:
-                send_json(
-                self.tcp_sock,
-                {"type": "move", "row": row, "col": col, "value": value},
-            )
-            except (ConnectionResetError, OSError):
-                print("[CLIENT] Cannot send, server disconnected.")
-                self.running = False
-                break
+
+            self._send({
+                "type": MSG_MOVE, "row": row, "col": col, "value": value
+            })
+
+        if self.conn is not None:
+            self.conn.close()
+
+    def _send(self, obj):
+        conn = self.conn
+        if conn is None:
+            print("[CLIENT] Not connected.")
+            return
         try:
-            self.tcp_sock.close()
+            conn.send(obj)
         except OSError:
-            pass
+            print("[CLIENT] Cannot send, server disconnected.")
 
     def _handle_command(self, cmd):
         name = cmd[1:].strip().lower()
@@ -352,19 +372,7 @@ class Client:
         if redraw_board:
             self.print_state()
         if want_hint:
-            try:
-                send_json(self.tcp_sock, {"type": "hint"})
-            except (ConnectionResetError, OSError):
-                print("[CLIENT] Cannot request hint, server disconnected.")
-
-    def _reconnect(self):
-        while self.running:
-            print("[CLIENT] Primary server down. Retrying connection...")
-            self.discover_server()
-            if self.server_addr and self.connect():
-                print("[CLIENT] Reconnected to new primary server")
-                return
-            time.sleep(2)
+            self._send({"type": MSG_HINT})
 
 
 def main():

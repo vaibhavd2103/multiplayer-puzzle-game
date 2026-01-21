@@ -80,7 +80,6 @@ def create_multicast_listener():
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
     return sock
 
-
 def get_local_ip():
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -151,4 +150,4 @@ class MessageConnection:
         return self
 
     def __exit__(self, *exc):
-        self.close()
+        self.close() 
