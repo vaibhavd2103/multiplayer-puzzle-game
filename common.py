@@ -5,6 +5,7 @@ import socket
 # Shared constants
 MULTICAST_GROUP = "224.1.1.1"
 MULTICAST_PORT = 5007
+DISCOVERY_PREFIX = "primary_alive"
 
 # Default TCP port for game server
 DEFAULT_SERVER_PORT = 6000

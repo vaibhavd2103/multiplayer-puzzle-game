@@ -9,6 +9,7 @@ from common import (
     DEFAULT_SERVER_PORT,
     MULTICAST_GROUP,
     MULTICAST_PORT,
+    DISCOVERY_PREFIX,
     send_json,
     recv_json,
     create_multicast_sender,
@@ -118,11 +119,37 @@ class PrimaryServer:
                     # If sending fails, remove dead backup from dictionary.
                     self.backups.pop(sock, None)
 
+    def _announce_host(self):
+        if self.host and self.host != "0.0.0.0":
+            return self.host
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except OSError:
+            return "127.0.0.1"
+
+    def _multicast_heartbeat_loop(self):
+        """
+        Multicast discovery heartbeat for clients/backups.
+        """
+        host = self._announce_host()
+        while self.running:
+            message = f"{DISCOVERY_PREFIX} {host} {self.port}"
+            try:
+                self.multicast_sender.sendto(
+                    message.encode("utf-8"), (MULTICAST_GROUP, MULTICAST_PORT)
+                )
+            except OSError:
+                pass
+            time.sleep(2)
+
     def start(self):
         print(f"[PRIMARY] Listening on {self.host}:{self.port}")
         threading.Thread(target=self._accept_loop, daemon=True).start()
         threading.Thread(
             target=self._broadcast_primary_status, daemon=True
+        ).start()
+        threading.Thread(
+            target=self._multicast_heartbeat_loop, daemon=True
         ).start()
         threading.Thread(
             target=self._broadcast_backups, daemon=True
@@ -318,19 +345,7 @@ class PrimaryServer:
             print("[PRIMARY] Removing dead backup")
             self.backups.pop(sock, None)
 
-    # NOTE: multicast heartbeat loop is left commented out.
-    # All heartbeats are now TCP JSON messages ("primary_alive").
-    #
-    # def _multicast_heartbeat_loop(self):
-    #     while self.running:
-    #         message = f"primary_alive {self.host} {self.port}"
-    #         try:
-    #             self.multicast_sender.sendto(
-    #                 message.encode("utf-8"), (MULTICAST_GROUP, MULTICAST_PORT)
-    #             )
-    #         except OSError:
-    #             pass
-    #         time.sleep(2)
+    # NOTE: multicast is used only for discovery; TCP JSON is used for heartbeats.
 
 
 class BackupServer:
@@ -462,7 +477,7 @@ class BackupServer:
                 break
             msg = data.decode("utf-8")
             parts = msg.split()
-            if len(parts) == 3 and parts[0] == "primary_alive":
+            if len(parts) == 3 and parts[0] in (DISCOVERY_PREFIX, DISCOVERY_PREFIX.upper()):
                 host = parts[1]
                 port = int(parts[2])
                 self.last_heartbeat = time.time()

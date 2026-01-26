@@ -6,6 +6,7 @@ import time
 from common import (
     MULTICAST_GROUP,
     MULTICAST_PORT,
+    DISCOVERY_PREFIX,
     send_json,
     recv_json,
     create_multicast_listener,
@@ -55,7 +56,7 @@ class Client:
                 data, _ = sock.recvfrom(1024)
                 msg = data.decode("utf-8")
                 parts = msg.split()
-                if len(parts) == 3 and parts[0] == "PRIMARY_ALIVE":
+                if len(parts) == 3 and parts[0] in (DISCOVERY_PREFIX, DISCOVERY_PREFIX.upper()):
                     host = parts[1]
                     port = int(parts[2])
                     self.server_addr = (host, port)
