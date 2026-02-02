@@ -1,4 +1,3 @@
-
 import json
 import socket
 
@@ -6,6 +5,7 @@ import socket
 MULTICAST_GROUP = "224.1.1.1"
 MULTICAST_PORT = 5007
 DISCOVERY_PREFIX = "primary_alive"
+BROADCAST_ADDR = "255.255.255.255"
 
 # Default TCP port for game server
 DEFAULT_SERVER_PORT = 6000
@@ -51,6 +51,15 @@ def create_multicast_sender():
     return sock
 
 
+def create_broadcast_sender():
+    """
+    Create a UDP socket configured for broadcast sending.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    return sock
+
+
 def create_multicast_listener():
     """
     Create a UDP socket configured to listen to multicast group.
@@ -61,4 +70,21 @@ def create_multicast_listener():
 
     mreq = socket.inet_aton(MULTICAST_GROUP) + socket.inet_aton("0.0.0.0")
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    return sock
+
+
+def create_discovery_listener():
+    """
+    Create a UDP socket configured to listen for discovery via multicast
+    (when supported) or broadcast on the same port.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("", MULTICAST_PORT))
+    try:
+        mreq = socket.inet_aton(MULTICAST_GROUP) + socket.inet_aton("0.0.0.0")
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    except OSError:
+        # Multicast join may fail on some networks/OSes; broadcast still works.
+        pass
     return sock

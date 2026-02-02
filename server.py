@@ -10,10 +10,13 @@ from common import (
     MULTICAST_GROUP,
     MULTICAST_PORT,
     DISCOVERY_PREFIX,
+    BROADCAST_ADDR,
     send_json,
     recv_json,
     create_multicast_sender,
     create_multicast_listener,
+    create_discovery_listener,
+    create_broadcast_sender,
 )
 
 
@@ -102,6 +105,7 @@ class PrimaryServer:
         self.tcp_sock.listen(5)
 
         self.multicast_sender = create_multicast_sender()
+        self.broadcast_sender = create_broadcast_sender()
 
     def _broadcast_primary_status(self):
         """
@@ -121,15 +125,23 @@ class PrimaryServer:
 
     def _announce_host(self):
         if self.host and self.host != "0.0.0.0":
+            print(f"[PRIMARY] Announce host set by flag: {self.host}")
             return self.host
+        # Best-effort LAN IP detection for discovery payloads.
         try:
-            return socket.gethostbyname(socket.gethostname())
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            probe.connect(("8.8.8.8", 80))
+            ip = probe.getsockname()[0]
+            probe.close()
+            print(f"[PRIMARY] Announce host detected: {ip}")
+            return ip
         except OSError:
+            print("[PRIMARY] Announce host fallback to 127.0.0.1")
             return "127.0.0.1"
 
-    def _multicast_heartbeat_loop(self):
+    def _discovery_heartbeat_loop(self):
         """
-        Multicast discovery heartbeat for clients/backups.
+        Discovery heartbeat for clients/backups via multicast and broadcast.
         """
         host = self._announce_host()
         while self.running:
@@ -138,6 +150,14 @@ class PrimaryServer:
                 self.multicast_sender.sendto(
                     message.encode("utf-8"), (MULTICAST_GROUP, MULTICAST_PORT)
                 )
+                # print(f"[PRIMARY] Discovery multicast -> {MULTICAST_GROUP}:{MULTICAST_PORT} ({message})")
+            except OSError:
+                pass
+            try:
+                self.broadcast_sender.sendto(
+                    message.encode("utf-8"), (BROADCAST_ADDR, MULTICAST_PORT)
+                )
+                # print(f"[PRIMARY] Discovery broadcast -> {BROADCAST_ADDR}:{MULTICAST_PORT} ({message})")
             except OSError:
                 pass
             time.sleep(2)
@@ -149,7 +169,7 @@ class PrimaryServer:
             target=self._broadcast_primary_status, daemon=True
         ).start()
         threading.Thread(
-            target=self._multicast_heartbeat_loop, daemon=True
+            target=self._discovery_heartbeat_loop, daemon=True
         ).start()
         threading.Thread(
             target=self._broadcast_backups, daemon=True
@@ -365,7 +385,7 @@ class BackupServer:
             if primary_host and primary_port
             else None
         )
-        self.last_heartbeat = time.time()
+        self.last_heartbeat = None
         self.mode = "backup"  # or "primary"
         self.tcp_conn = None
 
@@ -469,13 +489,15 @@ class BackupServer:
             ).start()
             return
 
-        sock = create_multicast_listener()
+        sock = create_discovery_listener()
+        print(f"[BACKUP {self.backup_id}] Listening for discovery on {MULTICAST_GROUP}:{MULTICAST_PORT} (multicast/broadcast)")
         while self.running and self.mode == "backup":
             try:
-                data, _ = sock.recvfrom(1024)
+                data, addr = sock.recvfrom(1024)
             except OSError:
                 break
             msg = data.decode("utf-8")
+            print(f"[BACKUP {self.backup_id}] Discovery packet from {addr}: {msg}")
             parts = msg.split()
             if len(parts) == 3 and parts[0] in (DISCOVERY_PREFIX, DISCOVERY_PREFIX.upper()):
                 host = parts[1]
@@ -520,6 +542,8 @@ class BackupServer:
             time.sleep(2)
             if self.mode != "backup":
                 continue
+            if self.last_heartbeat is None:
+                continue
             if time.time() - self.last_heartbeat <= 6:
                 continue
 
@@ -549,6 +573,9 @@ class BackupServer:
             print(f"[ELECTED PRIMARY {self.backup_id}] Removed self from backups: {sorted(self.known_backups)}")
             print(f"[BACKUP {self.backup_id}] Promoting to PRIMARY")
             self.mode = "primary"
+            if self.primary_addr is None:
+                print(f"[BACKUP {self.backup_id}] No primary address known yet; waiting for discovery")
+                continue
             host, port = self.primary_addr
 
             primary = PrimaryServer(host, port)

@@ -9,7 +9,7 @@ from common import (
     DISCOVERY_PREFIX,
     send_json,
     recv_json,
-    create_multicast_listener,
+    create_discovery_listener,
 )
 
 
@@ -48,13 +48,14 @@ class Client:
             return False
 
     def discover_server(self):
-        sock = create_multicast_listener()
+        sock = create_discovery_listener()
         sock.settimeout(10)
-        print("[CLIENT] Waiting for server multicast announcement...")
+        print("[CLIENT] Waiting for server discovery (multicast/broadcast)...")
         try:
             while True:
-                data, _ = sock.recvfrom(1024)
+                data, addr = sock.recvfrom(1024)
                 msg = data.decode("utf-8")
+                print(f"[CLIENT] Discovery packet from {addr}: {msg}")
                 parts = msg.split()
                 if len(parts) == 3 and parts[0] in (DISCOVERY_PREFIX, DISCOVERY_PREFIX.upper()):
                     host = parts[1]
@@ -64,6 +65,11 @@ class Client:
                     break
         except socket.timeout:
             print("[CLIENT] No server announcement received.")
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     def _receiver_loop(self):
         while self.running:
