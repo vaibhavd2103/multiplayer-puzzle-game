@@ -60,6 +60,45 @@ def create_broadcast_sender():
     return sock
 
 
+def get_local_ip():
+    """
+    Best-effort local IPv4 selection without external dependencies.
+    """
+    # Try common public resolver IPs to get the outbound interface IP.
+    for probe_ip in ("8.8.8.8", "1.1.1.1"):
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            probe.connect((probe_ip, 80))
+            ip = probe.getsockname()[0]
+            probe.close()
+            if ip and not ip.startswith("127."):
+                return ip
+        except OSError:
+            pass
+    # Fallback: resolve hostname and pick first non-loopback IPv4.
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and not ip.startswith("127."):
+                return ip
+    except OSError:
+        pass
+    return "127.0.0.1"
+
+
+def get_broadcast_targets(local_ip):
+    """
+    Returns a list of broadcast targets to try.
+    """
+    targets = {BROADCAST_ADDR}
+    # Guess /24 broadcast for common private ranges to improve LAN delivery.
+    parts = local_ip.split(".")
+    if len(parts) == 4 and all(p.isdigit() for p in parts):
+        targets.add(".".join(parts[:3]) + ".255")
+    return list(targets)
+
+
 def create_multicast_listener():
     """
     Create a UDP socket configured to listen to multicast group.

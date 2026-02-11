@@ -17,6 +17,8 @@ from common import (
     create_multicast_listener,
     create_discovery_listener,
     create_broadcast_sender,
+    get_local_ip,
+    get_broadcast_targets,
 )
 
 
@@ -118,7 +120,7 @@ class PrimaryServer:
             time.sleep(2)
             for sock in list(self.backups):
                 try:
-                    send_json(sock, {"type": "primary_alive"})
+                    send_json(sock, {"type": DISCOVERY_PREFIX})
                 except Exception:
                     # If sending fails, remove dead backup from dictionary.
                     self.backups.pop(sock, None)
@@ -128,22 +130,16 @@ class PrimaryServer:
             print(f"[PRIMARY] Announce host set by flag: {self.host}")
             return self.host
         # Best-effort LAN IP detection for discovery payloads.
-        try:
-            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            probe.connect(("8.8.8.8", 80))
-            ip = probe.getsockname()[0]
-            probe.close()
-            print(f"[PRIMARY] Announce host detected: {ip}")
-            return ip
-        except OSError:
-            print("[PRIMARY] Announce host fallback to 127.0.0.1")
-            return "127.0.0.1"
+        ip = get_local_ip()
+        print(f"[PRIMARY] Announce host detected: {ip}")
+        return ip
 
     def _discovery_heartbeat_loop(self):
         """
         Discovery heartbeat for clients/backups via multicast and broadcast.
         """
         host = self._announce_host()
+        broadcast_targets = get_broadcast_targets(host)
         while self.running:
             message = f"{DISCOVERY_PREFIX} {host} {self.port}"
             try:
@@ -153,13 +149,14 @@ class PrimaryServer:
                 # print(f"[PRIMARY] Discovery multicast -> {MULTICAST_GROUP}:{MULTICAST_PORT} ({message})")
             except OSError:
                 pass
-            try:
-                self.broadcast_sender.sendto(
-                    message.encode("utf-8"), (BROADCAST_ADDR, MULTICAST_PORT)
-                )
-                # print(f"[PRIMARY] Discovery broadcast -> {BROADCAST_ADDR}:{MULTICAST_PORT} ({message})")
-            except OSError:
-                pass
+            for target in broadcast_targets:
+                try:
+                    self.broadcast_sender.sendto(
+                        message.encode("utf-8"), (target, MULTICAST_PORT)
+                    )
+                    # print(f"[PRIMARY] Discovery broadcast -> {target}:{MULTICAST_PORT} ({message})")
+                except OSError:
+                    pass
             time.sleep(2)
 
     def start(self):
@@ -447,7 +444,7 @@ class BackupServer:
                         # Force reconnect to new primary
                         break
 
-                    if msg_type == "primary_alive":
+                    if msg_type == DISCOVERY_PREFIX:
                         self.last_heartbeat = time.time()
                         continue
 
