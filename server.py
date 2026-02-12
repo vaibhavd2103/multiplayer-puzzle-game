@@ -96,8 +96,7 @@ class PrimaryServer:
         self.game = GameState()
 
         self.clients = {}  # socket -> name
-        # FIX: use dict instead of set; store metadata (e.g., id) per backup.
-        # backups: socket -> {"id": int}
+       
         self.backups = {}
         self.running = True
 
@@ -597,7 +596,7 @@ class BackupServer:
                 try:
                     send_json(self.tcp_conn, {
                         "type": "new_primary",
-                        "host": host,
+                        "host": announced_host,
                         "port": port,
                         "id": self.backup_id
                     })
