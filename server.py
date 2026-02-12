@@ -393,6 +393,17 @@ class BackupServer:
         )
         # Set of known backup ids (including self).
         self.known_backups = {self.backup_id}
+        self._connect_thread = None
+        self._connect_lock = threading.Lock()
+
+    def _start_connect_thread(self):
+        with self._connect_lock:
+            if self._connect_thread and self._connect_thread.is_alive():
+                return
+            self._connect_thread = threading.Thread(
+                target=self._connect_to_primary, daemon=True
+            )
+            self._connect_thread.start()
 
     def _connect_to_primary(self):
         # Keep trying to connect while we are a backup
@@ -481,10 +492,7 @@ class BackupServer:
                 f"[BACKUP {self.backup_id}] Using specified primary at "
                 f"{self.primary_addr[0]}:{self.primary_addr[1]}"
             )
-            threading.Thread(
-                target=self._connect_to_primary, daemon=True
-            ).start()
-            return
+            self._start_connect_thread
 
         sock = create_discovery_listener()
         print(f"[BACKUP {self.backup_id}] Listening for discovery on {MULTICAST_GROUP}:{MULTICAST_PORT} (multicast/broadcast)")
@@ -500,15 +508,14 @@ class BackupServer:
                 host = parts[1]
                 port = int(parts[2])
                 self.last_heartbeat = time.time()
-                if self.primary_addr is None:
+                if self.primary_addr != (host, port):
                     self.primary_addr = (host, port)
                     print(
                         f"[BACKUP {self.backup_id}] "
                         f"Discovered primary at {host}:{port}"
                     )
-                    threading.Thread(
-                        target=self._connect_to_primary, daemon=True
-                    ).start()
+                    if self.mode == "backup":
+                        self._start_connect_thread()
 
     def start(self):
         print(f"[BACKUP {self.backup_id}] Starting in backup mode")
@@ -570,13 +577,16 @@ class BackupServer:
             print(f"[ELECTED PRIMARY {self.backup_id}] Removed self from backups: {sorted(self.known_backups)}")
             print(f"[BACKUP {self.backup_id}] Promoting to PRIMARY")
             self.mode = "primary"
-            if self.primary_addr is None:
-                print(f"[BACKUP {self.backup_id}] No primary address known yet; waiting for discovery")
-                continue
-            host, port = self.primary_addr
-
-            primary = PrimaryServer(host, port)
-
+            port = (
+                self.primary_addr[1]
+                if self.primary_addr is not None
+                else DEFAULT_SERVER_PORT
+            )
+            bind_host = "0.0.0.0"
+            announced_host = get_local_ip()
+            primary = PrimaryServer(bind_host, port)
+            self.primary_addr = (announced_host, port)
+            
             if self.game_state is not None:
                 primary.game.round = self.game_state.get("round", 1)
                 primary.game.grid = self.game_state.get("grid", primary.game.grid)
