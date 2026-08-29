@@ -1,82 +1,144 @@
 # Distributed Puzzle Game
 
-This project is a distributed system implementation of a puzzle game. It consists of a server and multiple clients that communicate to solve puzzles collaboratively.
+A small distributed system: a collaborative number‑placing puzzle played by
+multiple terminal clients against a replicated server. The server runs as a
+**primary** with any number of **backups**; if the primary dies, a backup is
+elected, promotes itself, and clients reconnect automatically.
+
+Everything is Python standard library — no third‑party dependencies.
+
+## How it works
+
+### The game
+
+* A shared `GRID_SIZE`×`GRID_SIZE` grid (default **4×4**). Each cell has a
+  hidden solution value in `1..9`; ~40% of cells start blank.
+* Players submit `row col value` moves:
+  * correct → **+1** point, the cell is filled for everyone
+  * incorrect → **−1** point
+  * `/hint` reveals one random blank cell but costs **−2** points
+* When every cell is filled the round ends and a fresh puzzle starts
+  (`round` increments, scores carry over).
+
+### Processes and transport
+
+| Component | Role |
+|-----------|------|
+| `server.py --role primary` | Owns the authoritative `GameState`, accepts client/backup TCP connections, broadcasts every update. |
+| `server.py --role backup` | Connects to the primary over TCP, mirrors state, watches heartbeats, and can be elected primary. |
+| `client.py` | Connects over TCP, renders the board, sends moves/hints. |
+
+* **TCP** carries newline‑delimited JSON messages (`common.MessageConnection`).
+* **UDP multicast** (`224.1.1.1:5007`) carries the primary's presence
+  announcement `primary_alive <host> <port>`, used by clients and backups for
+  discovery and post‑failover re‑discovery.
+
+### Failover
+
+1. The primary multicasts `primary_alive` and sends TCP heartbeats to backups
+   every 2 s.
+2. If a backup sees no heartbeat for 6 s, it starts an election.
+3. Highest `backup_id` wins; that backup binds `0.0.0.0:<port>`, seeds the
+   preserved game state, and starts announcing as the new primary.
+4. Other backups and all clients see the new announcement and reconnect.
 
 ## Prerequisites
 
-1. Python 3.10 or higher installed on your system.
-2. A virtual environment set up for the project.
+* Python **3.10+**
+* No packages to install (`requirements.txt` is intentionally empty)
+* Clients discover the server via UDP multicast, so run them on the same
+  host / LAN segment, or pass `--host`/`--port` explicitly.
 
-## Setup Instructions
+## Running locally
 
-### Step 1: Clone the Repository
-
-Clone the project repository to your local machine:
-
-```bash
-git clone <repository-url>
-cd distributed_puzzle_game
-```
-
-### Step 2: Set Up Virtual Environment
-
-Create and activate a virtual environment:
+Optionally create a virtual environment first:
 
 ```bash
 python -m venv .venv
+# Windows:        .venv\Scripts\activate
+# macOS / Linux:  source .venv/bin/activate
 ```
 
-- On Windows:
+### 1. Start the primary
 
 ```bash
-.venv\Scripts\activate
+python server.py --role primary --port 6000
 ```
 
-- On macOS/Linux:
+### 2. Start one or more backups (optional, enables failover)
 
 ```bash
-source .venv/bin/activate
+python server.py --role backup --primary-host 127.0.0.1 --primary-port 6000 --backup-id 100
+python server.py --role backup --primary-host 127.0.0.1 --primary-port 6000 --backup-id 200
 ```
 
-### Step 3: Install Dependencies
-
-Install the required dependencies:
+### 3. Start clients
 
 ```bash
-pip install -r requirements.txt
+python client.py --name alice          # auto-discovers via multicast
+python client.py --name bob --host 127.0.0.1 --port 6000   # explicit
 ```
 
-### Step 4: Run the Server
+### 4. Try a failover
 
-Start the server:
+Kill the primary (`Ctrl+C`). Within ~8 s the highest‑id backup logs
+`Elected PRIMARY` and each client logs `Reconnected to primary server`.
+
+## Client commands
+
+| Input | Action |
+|-------|--------|
+| `row col value` | Make a move, e.g. `0 1 5` |
+| `/hint` | Reveal a random blank cell (−2 points) |
+| `/stats` | Your session stats — accuracy, streaks, toughest cells |
+| `/board` | Redraw the current board |
+| `/help` | List commands |
+| `quit` | Leave the game |
+
+## Command‑line reference
+
+**Server**
+
+| Flag | Applies to | Default | Meaning |
+|------|-----------|---------|---------|
+| `--role {primary,backup}` | both | *(required)* | Which role to start |
+| `--host` | primary | `0.0.0.0` | Address to bind |
+| `--port` | primary | `6000` | TCP listen port |
+| `--primary-host` | backup | – | Primary's address (optional; multicast discovery is used otherwise) |
+| `--primary-port` | backup | – | Primary's port |
+| `--backup-id` | backup | random | Election id — highest wins |
+
+**Client**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--name` | *(required)* | Player name |
+| `--host` / `--port` | – | Connect directly instead of discovering via multicast |
+
+## Docker
+
+`docker-compose.yml` builds one primary, two backups, and an nginx container
+on a bridge network:
 
 ```bash
-python server.py --role primary --host 127.0.0.1 --port 6000
+docker compose up --build
 ```
 
-For backup server
+The primary's TCP port is published on `localhost:6000` for clients run from
+the host. Note that UDP‑multicast discovery does not cross the Docker bridge
+network, so containerised backups are given `--primary-host puzzle-primary`
+explicitly.
 
-```bash
-python server.py --role backup --host 127.0.0.1 --port 6000
+## Project layout
+
 ```
-
-### Step 5: Run the Clients
-
-Open multiple terminals and run the client script in each terminal:
-
-```bash
-python client.py --name Alice
+common.py   Shared constants, protocol message tags, MessageConnection
+            (buffered, thread-safe JSON framing), multicast socket helpers,
+            get_local_ip().
+server.py   GameState, PrimaryServer, BackupServer (election + promotion).
+client.py   Client (connect / reconnect / render) and SessionStats.
 ```
-
-### Step 6: Test the Distributed System
-
-Interact with the clients to test the distributed system functionality. Ensure that all clients can connect to the server and communicate effectively.
-
-## Notes
-
-- Ensure that the server is running before starting the clients.
-- If you encounter any issues, check the logs for error messages and ensure all dependencies are installed correctly.
 
 ## License
 
-This project is licensed under the MIT License.
+MIT.
