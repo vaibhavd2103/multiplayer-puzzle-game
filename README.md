@@ -139,6 +139,3 @@ server.py   GameState, PrimaryServer, BackupServer (election + promotion).
 client.py   Client (connect / reconnect / render) and SessionStats.
 ```
 
-## License
-
-MIT.
